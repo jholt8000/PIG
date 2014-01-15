@@ -1,0 +1,638 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Nov 01 09:38:16 2013
+
+@author: jholt
+"""
+from Tkinter import *
+import Tkinter as tk
+try: from PIL import ImageTk, Image
+except: pass #if PIL isn't installed Pig will not display the jpgs
+import tkFont
+import subprocess
+import optparse
+import os
+import threading
+from Keck_utils import Keck_utils
+
+class ThreadedClient:
+    def __init__(self,master, instr, debug, killself, killothers):
+          self.master=master
+          # instansiate the PIG
+          self.gui=Pig(master, instr, debug, killself, killothers)
+          self.running = 1
+          # run background thread that pings keywords
+          self.thread1=threading.Thread(target=self.periodicCall)
+          self.thread1.start()      
+    
+    def periodicCall(self):
+          #self.gui.background_check is Pig method that ping keywords 
+          self.gui.background_check()
+          if not self.running :
+              os.exit()
+          self.master.after(30000,self.periodicCall) #runs every 30 sec     
+
+class Pig(Keck_utils):
+    def __init__(self,master,instr,debug,killself,killothers):
+        self.frame=tk.Frame(master)
+        self.top=tk.Frame(master)
+        self.top.pack(fill='x')
+        self.frame.pack(expand='yes',fill='both')
+        
+        self.instr=instr
+        
+        # Keck_utils get_date sets self.date and self.ut_date
+        self.get_date()
+    
+        # verbose?
+        self.debug=debug
+        
+        self.titlefont=tkFont.Font(family='Helvetica',size=10)
+        self.smallfont=tkFont.Font(family='Helvetica',size=8)
+
+        # open the pig image and koa logo and display at top
+        self.make_piggie()
+
+        Label(self.top, text=instr+" Program Identification GUI",foreground="red",compound=CENTER).grid(row=0,column=1,columnspan=1,sticky='WENS')
+
+        # kill other open pigs if killothers=True and kill this one if killself=True
+        self.make_bacon(killself,killothers)
+        
+        # get instrument hosts/library names for modify/show calls (sets self.host, self.library)
+        self.instrument_info(instr)
+        
+        self.outdir=''
+        # get output directory name  (sets self.outdir)      
+        self.get_outdir(verify_date=True)            
+
+        # get_prog_info opens the schedule database table and parses '/' results 
+        self.firstprog,self.firstobs,self.secondprog,self.secondobs,self.thirdprog,self.thirdobs=self.get_prog_info(instr,self.date)
+        #self.observer=self.firstobs
+
+        # set up widget geometry        
+        self.rowadd=1
+        self.sched_widgets=[]
+       
+        if not self.firstprog and 'NIR' in instr:
+            # attempt to find a backup program for NIRSPEC<->NIRC2
+            self.get_backup_program()
+ 
+        if self.firstprog: 
+            Label(self.frame, text="OBSERVER").grid(row=self.rowadd-1,column=1,sticky='W')
+            Label(self.frame, text="Program").grid(row=self.rowadd-1,column=0,sticky='W')
+            
+        else:
+            # couldn't find anything on schedule for this instrument
+            Label(self.frame,text=instr+' not scheduled tonight',foreground='red').grid(row=1,column=0,sticky='WE',columnspan=2)   
+            
+            Label(self.frame, text="OBSERVER").grid(row=self.rowadd+1,column=1,sticky='W')
+            Label(self.frame, text="Program").grid(row=self.rowadd+1,column=0,sticky='W')
+            self.sched_widgets.append(['no_prog'])
+            # let them setup outdir/observer anyway
+            self.sched_widgets[0].append(Button(self.frame,text='create and set outdir',command=lambda: self.big_button(0,'Unknown')))
+            self.sched_widgets[0][1].grid(row=self.rowadd+2,column=0,sticky='W',columnspan=1,padx=(0,20))       
+            self.entrybox=Entry(self.frame)
+            self.entrybox.grid(row=3,column=1,sticky='WE',columnspan=1)
+            Button(self.frame,text='Set',command=lambda: self.set_obs(self.entrybox.get(),0)).grid(row=3,column=2,sticky='E')            
+            self.rowadd=4
+            
+        allprogs=((self.firstprog,self.firstobs),(self.secondprog,self.secondobs),(self.thirdprog,self.thirdobs))
+        
+        # go through all of the found programs and create program button+observer entry box+observer set button for each
+        i=0
+        for line in allprogs:
+            prog,observer=line[0],line[1]
+            if prog:
+                self.rowadd=self.rowadd+i    
+                self.sched_widgets.append([prog])
+                
+                # add main program button
+                self.sched_widgets[i].append(Button(self.frame,text=prog+' '+observer,font=self.titlefont,command=lambda i=i,obs=observer: self.big_button(i,obs)))
+                self.sched_widgets[i][1].grid(row=self.rowadd,column=0,sticky='WE',columnspan=1,padx=(0,20))        
+    
+                # add observer entry box
+                self.sched_widgets[i].append(Entry(self.frame))
+                self.sched_widgets[i][2].bind("<Return>",lambda i=i: self.set_obs(self.sched_widgets[i][2].get(),i))
+                self.sched_widgets[i][2].grid(row=self.rowadd,column=1,sticky='WE',columnspan=1)
+                                              
+                # add 'Set' button to change observer
+                self.sched_widgets[i].append(Button(self.frame,text='Set', font=self.smallfont,command=lambda i=i: self.set_obs(self.sched_widgets[i][2].get(),i)))
+                self.sched_widgets[i][3].grid(row=self.rowadd,column=2,stick='WE',columnspan=1)        
+                
+            i+=1
+            
+        # call 'show -s ' for observer/outdir etc and update label on bottom of GUI
+        self.change_label()
+        
+        # make room for extra keywords (like outfile/outdir2/nextfile) in label display 
+        if instr=='HIRES': self.rowadd_for_ToO=self.rowadd+5
+        elif instr=='NIRSPEC': self.rowadd_for_ToO=self.rowadd+7
+        else: self.rowadd_for_ToO=self.rowadd+3
+
+        self.button_ToO=Button(self.frame,text='Show ToO Programs',font=self.smallfont,command=self.toggle)
+        self.button_ToO.grid(row=self.rowadd_for_ToO,column=0,sticky='W')
+            
+        #end main GUI setup
+        
+    def background_check(self):
+        # runs every 30 seconds and checks that current outdir/observer match instrument settings 
+        if not self.killed:
+            try: self.tick.grid_forget()
+            except: pass
+            self.tick= Label(self.frame,text='searching for keyword changes...',foreground='dark green',font=self.smallfont)
+            self.tick.grid(row=self.rowadd_for_ToO,column=1,sticky='E',columnspan=2)
+            new_outdir=self.show_keyword(keywordname='outdir').strip()
+            new_observer=self.show_keyword(keywordname='observer').strip()
+            if self.outdir.rstrip('/') != new_outdir.rstrip('/'):
+                self.tick.configure(text='found mismatching outdir keyword old: '+self.outdir+'  new: '+new_outdir) 
+                self.outdir=new_outdir
+                self.change_label(fontcolor='red')        
+            elif self.observer != new_observer:
+                self.tick.configure(text='found mismatching observer keywords old: '+self.observer+'  new: '+new_observer)
+                self.observer=new_observer
+                self.change_label(fontcolor='red')
+            else:
+               try: self.tick.grid_forget()
+               except: pass
+               self.tick= Label(self.frame,text='searching for keyword changes...',foreground='dark green',font=self.smallfont)
+               self.tick.grid(row=self.rowadd_for_ToO,column=1,sticky='E',columnspan=2)
+                
+ 
+    def get_backup_program(self):
+        # called when NIR* instrument is not on schedule; looks for NIRC2 <-> NIRSPEC 
+            Label(self.frame,text=instr+' not scheduled tonight',foreground='red').grid(row=1,column=0,sticky='WE',columnspan=2)   
+            if 'NIRS' in instr:
+                self.firstprog,self.firstobs,self.secondprog,self.secondobs,self.thirdprog,self.thirdobs=self.get_prog_info('NIRC2',self.date)
+                if self.firstprog:
+                    self.rowadd=self.rowadd+1
+                    Label(self.frame,text=instr+' Using backup to a NIRC2 program',foreground='red').grid(row=2,column=0,sticky='WE',columnspan=2)    
+            elif 'NIRC' in instr:
+                self.firstprog,self.firstobs,self.secondprog,self.secondobs,self.thirdprog,self.thirdobs=self.get_prog_info('NIRSPEC',self.date)
+                if self.firstprog:
+                    self.rowadd=self.rowadd+1
+                    Label(self.frame,text='Using backup to a NIRSPEC program',foreground='black').grid(row=2,column=0,sticky='WE',columnspan=2)   
+           
+    def make_piggie(self):
+        # open pig image and koa logo and display -GUI 
+        try:
+            im=Image.open("/net/kalahuipuaa/local/apps1/kroot/instr/koa/pig_image.JPG")
+            size=30,30
+            im.thumbnail(size,Image.ANTIALIAS)
+            self.pig=ImageTk.PhotoImage(im)
+            panel=Label(self.top,image=self.pig)
+            panel.grid(row=0,column=0,rowspan=1,sticky='WENS')   
+            koa=Image.open("/net/kalahuipuaa/local/apps1/kroot/instr/koa/logo_koa.jpg")
+            size=50,50
+            koa.thumbnail(size,Image.ANTIALIAS)
+            self.koaim=ImageTk.PhotoImage(koa)
+            panel=Label(self.top,image=self.koaim)
+            panel.grid(row=0,column=2,sticky='WENS')               
+            
+        except:
+            # no images
+            pass
+        
+    def make_bacon(self,killself,killothers):
+        # handles the -a,-k input parameters - GUI
+        if killself: killothers=True
+        if killothers:
+            try:
+                home=os.getenv("HOME")
+                f=open(home+'/.pig_pid','r+')
+                lines=f.readlines()
+                f.close()
+                for pid in lines:
+                    try: subprocess.Popen("rsh kalahuipuaa kill -TERM "+pid, shell=True, stdout=subprocess.PIPE).communicate()
+                    except: 
+                        if self.debug: print 'could not kill '+pid
+                os.remove(home+'/.pig_pid')
+                open(home+'/.pig_pid','w+').close()
+            except:
+                if self.debug: print 'could not get pig_pid file'
+                pass
+
+        myPid=os.getpid()
+        home=os.getenv("HOME")
+        f=open(home+'/.pig_pid','a+')
+        f.write(str(myPid)+'\n')
+        f.close()
+        
+        self.killed=False
+        if killself:
+            self.killed=True
+            subprocess.Popen("rsh kalahuipuaa kill -TERM "+str(myPid), shell=True, stdout=subprocess.PIPE).communicate()
+            os.remove('~/.pig_pid')
+            open(x,'~/.pig_pid').close()
+                      
+
+    def toggle(self):
+        # toggle method is called when button clicked to Show ToO Programs
+
+        self.list1=self.get_time_progs()
+        list1=self.list1
+        global list2
+        if ' '.join(self.button_ToO.config('text')[-1]) == 'Show ToO Programs':
+
+            # User wishes to show all the ToO program buttons
+            self.button_ToO.configure(text='Hide ToO Programs')
+
+            i=0
+            list2=[]
+            
+            if list1==[]:
+                self.outdirlabel=Label(self.frame,text='No additional programs for '+self.instr,foreground='red',font=self.smallfont)
+                self.outdirlabel.grid(row=self.rowadd_for_ToO+3,column=1,columnspan=1,sticky='W')                         
+                
+            for line in list1:
+                prog,observer,info=line.split(',')
+                
+                list2.append([prog])
+                list2[i].append(Button(self.frame,text=prog+' '+observer,font=self.titlefont,command=lambda i=i: self.setextra1(i)))
+                list2[i][1].grid(row=self.rowadd_for_ToO+4+i,columnspan=1,sticky='WE',column=0)        
+
+                list2[i].append(Button(self.frame,text='Info', font=self.smallfont,command=lambda i=i: self.display_info(i)))
+                list2[i][2].grid(row=self.rowadd_for_ToO+4+i,column=1)
+                
+                i+=1
+        else:
+
+            # user wishes to hide all the ToO program buttons
+            if list1==[]:
+                self.outdirlabel.grid_forget()
+                
+            self.button_ToO.configure(text='Show ToO Programs')
+            
+            i=len(list2)-1            
+            while i > -1:
+                list2[i][2].grid_forget()
+                list2[i][1].grid_forget()
+                i-=1               
+ 
+    def display_info(self,i):
+        # called when 'Info' box pressed and pops up a text box of ToO program info
+        import tkMessageBox
+        tkMessageBox.showinfo('Info',self.return_info(i))
+        
+    def return_info(self,i):
+        # returns a string of ToO program information
+        prog,pi,info=self.list1[i].split(',')
+        return "Program "+prog+' '+info
+        
+    def big_button(self,button_number,observer):
+        # called when main scheduled program button pressed
+        # sets observer and outdir keywords
+             
+        self.sched_widgets[button_number][1].configure(bg='green',activebackground='light green')
+        
+        # Turn the other buttons back to grey
+        i=0
+        while i < len(self.sched_widgets):
+            if i != button_number:
+                self.sched_widgets[i][1].configure(bg='light grey',activebackground='grey')
+            i=i+1
+    
+        self.observer=observer
+        self.get_outdir(verify_date=True)
+        print 'self.outdir=',self.outdir,' self.outdirorig=',self.outdirorig
+
+        if (instr == 'HIRES' and self.outdir == ''):
+             Label(self.frame, text="HIRES not initialized yet, please run hires_init and try again").grid(row=2,column=1,sticky='W')
+             sys.exit()
+        elif (self.outdir == ''): 
+             self.run_new_dir()
+             self.get_outdir(verify_date=False)
+             
+        # remove the /spec in dir for nirc2/nirspec
+        self.outdirorig.rstrip('/').rstrip('/spec') 
+        
+        # append the _B or _C to directory name
+        self.buttondict={0:('','black'),1:('_B','blue'),2:('_C','red')}
+        self.outdir=self.outdirorig+self.buttondict[button_number][0]
+        
+        # mkdir the appended _B directory if it doesn't exist
+        if not os.path.isdir('/s'+self.outdir): self.make_new_dir(self.outdir)
+        
+        # set the observer and outdir keywords (calls modify)
+        self.set_prog()
+      
+        # save if observer or outdir are empty strings (modify will not take ''s)
+        observer_prev='no error'
+        outdir_prev='no error'
+        if self.observer.strip()=='': observer_prev='error'
+        if self.outdir.strip()=='': outdir_prev='error'
+
+        # update the observer and outdir GUI labels (calls show and resets self.observer,self.outdir)
+        self.change_label(fontcolor='black') 
+        
+        # print a warning that the modify did not work since the keyword was empty string
+        if observer_prev=='error': self.change_label(fontcolor='red',error='observer')
+        if outdir_prev=='error': self.change_label(fontcolor='red',error='outdir')
+
+        # set the ToO buttons back to grey        
+        try:
+            i=0
+            while i < (len(list2)):
+                list2[i][1].configure(bg='light grey',activebackground='grey')
+                i=i+1
+        except:
+            pass 
+        
+
+    def change_label(self,fontcolor='black',error=''):
+        # calls 'show -s' to determine current outdir/observer keyword values
+        # updates OUTDIR= and OBSERVER: labels at bottom of GUI with findings
+        # only time this changes is if ToO button pressed        
+        if error.strip()=='observer': #error, couldn't modify observer
+            self.observerprev=''
+            self.observerlabel=Label(self.frame,text='OBSERVER: '+str(self.observer)+' [not updated to empty string!]',foreground=fontcolor)
+            self.observerlabel.grid(row=self.rowadd+1,column=0,columnspan=2,sticky='W')  
+
+        elif error.strip()=='outdir': 
+            self.outdirprev=''             
+            self.outdirlabel=Label(self.frame,text='OUTDIR: '+str(self.outdir)+' [not updated to empty string!]',foreground=fontcolor)
+            self.outdirlabel.grid(row=self.rowadd+2,column=0,columnspan=2,sticky='W')         
+        
+        else:                
+            # first remove any old labels to keep things clean        
+            try:
+                self.outdirlabel.grid_forget()
+                self.observerlabel.grid_forget()
+            except:
+                pass
+            # call show -s to find outdir, sets self.outdir
+            self.get_outdir(verify_date=False)
+            
+            # call show -s to find observer, sets self.observer
+            self.observer=self.show_keyword(keywordname='observer')
+            self.observerlabel=Label(self.frame,text='OBSERVER: '+str(self.observer),foreground=fontcolor)
+            self.observerlabel.grid(row=self.rowadd+1,column=0,columnspan=2,sticky='W')         
+            self.outdirlabel=Label(self.frame,text='OUTDIR: '+str(self.outdir),foreground=fontcolor)
+            self.outdirlabel.grid(row=self.rowadd+2,column=0,columnspan=2,sticky='W')          
+
+            if self.instr=='NIRSPEC':            
+                try: 
+                    self.outdir2.grid_forget()
+                    self.filename.grid_forget()
+                    self.filename2.grid_forget()
+                except: pass
+                outdir2=self.show_keyword(keywordname='outdir2')
+                filename1=self.show_keyword(keywordname='filename')
+                filename2=self.show_keyword(keywordname='filename2')
+ 
+                self.outdir2=Label(self.frame,text='OUTDIR2: '+str(outdir2),foreground=fontcolor)
+                self.outdir2.grid(row=self.rowadd+3,column=0,columnspan=2,sticky='W',rowspan=1)            
+                self.filename=Label(self.frame,text='Next File: '+str(filename1),foreground=fontcolor)
+                self.filename.grid(row=self.rowadd+4,column=0,columnspan=2,sticky='W',rowspan=1)            
+                self.filename2=Label(self.frame,text='Next File2: '+str(filename2),foreground=fontcolor)
+                self.filename2.grid(row=self.rowadd+5,column=0,columnspan=2,sticky='W',rowspan=1)    
+                
+            elif self.instr == 'HIRES':
+                try: 
+                    self.frameno.grid_forget()
+                    self.outfile.grid_forget()
+                except: pass
+                frameno=self.show_keyword(keywordname='frameno')
+                outfile=self.show_keyword(keywordname='outfile')
+                                       
+                self.frameno=Label(self.frame,text='FRAMENO='+str(frameno),foreground=fontcolor)
+                self.frameno.grid(row=self.rowadd+3,column=0,columnspan=2,sticky='W')   
+                self.outfile=Label(self.frame,text='OUTFILE='+str(outfile),foreground=fontcolor)
+                self.outfile.grid(row=self.rowadd+4,column=0,columnspan=2,sticky='W')   
+
+        
+    def set_obs(self,observer,button_number):
+        # called when 'Set' button is pressed
+        # calls modify_keyword to change observer keyword
+        # updates GUI labels, 
+        
+        self.observer=observer.strip()
+        self.modify_keyword("observer",self.observer)
+        if self.observer != '': self.change_label(fontcolor='black')
+        else: self.change_label(fontcolor='red',error='observer')
+        
+        # update the program button with new observer name from entry box           
+        self.sched_widgets[button_number][1].configure(text=self.firstprog+' '+self.observer)        
+        
+        # press the program button to change the program to current entry box 'Set'
+        self.big_button(button_number,observer)
+            
+    def setextra1(self,progidnum):
+        # called when ToO program button is pressed
+        # sets outdir and observer to what is in the ToO program
+        
+        progid,observer,info=self.list1[progidnum].split(',')
+        
+        self.get_outdir(verify_date=False)
+        
+        if (instr == 'HIRES' and self.outdir == ''):
+             Label(self.frame, text="HIRES not initialized yet, please run hires_init and try again").grid(row=2,column=1,sticky='W')
+        elif (self.outdir == ''): 
+             self.run_new_dir()
+             self.get_outdir(verify_date=False)
+        
+        # append the program id to the directory name (instead of the _B etc)
+        self.outdir=self.outdirorig+'_'+progid
+        self.observer=observer
+
+        # mkdir the appended _ToOprogram directory if it doesn't exist
+        if not os.path.isdir('/s'+self.outdir): self.make_new_dir(self.outdir)        
+
+       # set the observer and outdir keywords (calls modify)
+        self.set_prog()
+
+        # update the observer and outdir GUI labels (calls show)
+        self.change_label(fontcolor='magenta')
+        
+        # set active button to green
+        list2[progidnum][1].configure(bg='green',activebackground='light green')
+        
+        # Turn the other buttons back to grey            
+        i=0
+        while i < len(self.sched_widgets):
+            self.sched_widgets[i][1].configure(bg='light grey',activebackground='grey')
+            i=i+1
+         
+        i=0
+        while i < (len(list2)):
+            if i != progidnum:
+                list2[i][1].configure(bg='light grey',activebackground='grey')
+            i=i+1
+        
+    def get_prog_info(self,instr,date):
+        # read schedule database and returns program ids and observer names
+        # this method could be made into a loop to work for >3 splits and would be cleaner -JH
+        program_tuple=['','','','','','']
+        
+        date=date[0:4]+'-'+date[4:6]+'-'+date[6:8]
+        
+        if instr=='NIRSPEC': instrkey='NIRS'
+        else: instrkey=instr
+        q1="'select ProjCode,Observers,Instrument from telsched where Date="+'"'+date+'"and Instrument like "'+str('%'+instrkey+'%')+'"'"'"
+        x=subprocess.Popen("""echo """+q1+""" | rsh mysqlserver mysql -h mysqlserver -usched -psched -Dschedules""",shell=True, stdout=subprocess.PIPE).communicate()[0] 
+        y=x.splitlines()
+        
+        try: 
+            z=y[1].split('\t')
+        except:
+            return program_tuple
+        try: 
+            allprogids=z[0].split('/')
+            allobservers=z[1].split('/')
+            allinstrs=z[2].split('/')
+        except: 
+            return program_tuple
+        
+        i=0
+        j=0
+        
+        if len(allprogids) > 1 and len(allinstrs)==1: allinstrs.append(allinstrs[0])
+        
+        while i < len(allprogids):
+
+            if instrkey in allinstrs[i]:                
+                program_tuple[j]=allprogids[i]
+                if allobservers == ['']: program_tuple[j+1]=='Unknown'
+                try: 
+                    if allobservers[i]: program_tuple[j+1]=self.clean_observer_names(allobservers[i])
+                    else: program_tuple[j+1]='Unknown'
+                except: program_tuple[j+1]='Unknown'
+                j+=2
+            i+=1
+         
+        return program_tuple
+      
+    def clean_observer_names(self,obs):
+        # Remove the inst names within parens that sometimes occur in schedule
+        listinst=['UCSC','UCD','UCB','UCLA','UCR','CIT','UCSD','UCSB']
+        for institution in listinst:
+            obs=obs.replace(', ('+institution+'),',',')
+            obs=obs.replace(',('+institution+'),',',')
+            obs=obs.replace('('+institution+')','')
+
+        obs=obs.replace(' ','')
+        obs=obs.replace('*','')
+        obs=obs.strip()
+        obs=obs.rstrip(',')
+        
+        return obs
+    
+
+    def set_prog(self):
+        # set the program observer and outdir keywords
+        # modify observer name to self.observer & runs 'outdir' or 'runname' using self.outdir, depending on instrument
+        
+        if self.instr == 'DEIMOS' or self.instr=='MOSFIRE' or self.instr=='ESI': #call 'outdir' script
+            cur_outdir=self.show_keyword(keywordname='outdir')
+            if cur_outdir != self.outdir:
+                subprocess.Popen("rsh "+self.host+" outdir "+self.outdir, shell=True, stdout=subprocess.PIPE).communicate()
+            
+            self.modify_keyword(keywordname='observer',keywordvalue=self.observer)
+            
+        elif self.instr=='NIRC2' : #call 'runname' script
+
+            subprocess.Popen("rsh "+self.host+" runname "+self.outdir, shell=True, stdout=subprocess.PIPE).communicate()
+            self.modify_keyword(keywordname='observer',keywordvalue=self.observer)
+            
+        elif self.instr=='NIRSPEC':
+            subprocess.Popen("rsh "+self.host+" runname "+self.outdir, shell=True, stdout=subprocess.PIPE).communicate()
+            self.modify_keyword(keywordname='observer',keywordvalue=self.observer)
+            
+        elif self.instr=='OSIRIS':
+            # only update the observer name
+            self.modify_keyword(keywordname='observer',keywordvalue=self.observer)
+            
+        elif self.instr=='HIRES': # do some weird stuff--> hires has no handy script
+            
+            cur_outfile=self.show_keyword(keywordname='outfile')            
+            cur_frameno=self.show_keyword(keywordname='frameno')            
+            
+            # need to set outfile to the new directory outfile before calling koa_lastimage
+            outdir_ls=os.listdir(self.outdir)
+            for fn in outdir_ls:
+                if ('fits' in fn): 
+                    try: 
+                        int(fn.strip('.fits')[-4:])
+                        outfile=fn.strip()[0:-9]
+                        break
+                    except:
+                        outfile='hires'
+                        continue # go to the next file
+            
+            # need to set outfile/outdir key before calling koa_lastimage
+            if cur_outfile != outfile:
+                self.modify_keyword(keywordname='outfile',keywordvalue=outfile)
+            self.modify_keyword(keywordname='outdir',keywordvalue=self.outdir)            
+            self.modify_keyword(keywordname='observer',keywordvalue=self.observer)
+            self.prev_obs = self.observer
+ 
+            lastimage = ""
+            # koa_lastimage uses OUTDIR to find most recent file 
+            lastimage = subprocess.Popen("rsh "+self.host+" koa_lastimage ", shell=True, stdout=subprocess.PIPE).communicate()[0]
+                
+            if lastimage == "":
+                outfile = 'hires' #should this happen?
+                frameno = 1
+            else:
+                list_hires = lastimage.split('/')
+                filename = list_hires[-1].strip().strip('.fits')
+                outfile = filename[0:-4]
+                frameno = int(filename[-4:])
+                frameno = frameno + 1
+            
+            if cur_outfile != outfile:
+                self.modify_keyword(keywordname='outfile',keywordvalue=outfile)
+            
+            if cur_frameno != frameno:            
+                self.modify_keyword(keywordname='frameno',keywordvalue=frameno)
+            
+    def get_time_progs(self):
+        # read in time_progs comma separated text file to find all ToO programs
+        line1=[]
+        f=open('/net/kalahuipuaa/local/apps1/kroot/instr/koa/time_progs.txt')
+        for line in f:
+            line=line.rstrip()
+            if instr=='NIRSPEC': instrkey='NIRS' # for NIRSPAO
+            else: instrkey=instr
+            if instrkey in line.split(',')[0]:
+                line3=line.split(',')[1:]
+                line1.append(','.join(line3))
+            elif instrkey=='NIRS':
+                if 'NIRC' in line.split(',')[0]:
+                    line3=line.split(',')[1:]
+                    line1.append(','.join(line3))
+            elif 'NIRC' in instrkey:
+                if 'NIRS' in line.split(',')[0]:
+                    line3=line.split(',')[1:]
+                    line1.append(','.join(line3))
+                    
+        return line1
+    
+if __name__ == '__main__':
+    usage="""
+    pigmockup.py instr
+    """    
+    p=optparse.OptionParser(usage=usage)
+    p.add_option('--killself','-k',action='store_true',dest='kill_self',default=False,help='swinicide')
+    p.add_option('--killothers','-a',action='store_true',dest='kill_others',default=False,help='slaughter')
+    (options,args)=p.parse_args()
+    if len(args) < 1:
+        p.error('Wrong arguments')
+    else:
+        instr=args[0].upper()
+        
+    if options.kill_self: killself=True 
+    else: killself=False
+    if options.kill_others: killothers=True
+    else: killothers=False
+    
+    #make top level GUI
+    root=Tk()
+    root.winfo_toplevel().wm_geometry("")
+    root.title("PIG")
+   
+    ## uncomment the following line and comment out the client line for no threading/pinging keywords
+    ##app=Pig(root,instr,True,killself,killothers) 
+    client = ThreadedClient(root,instr,True,killself,killothers)
+    
+    root.mainloop()
+ 
